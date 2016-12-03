@@ -102,12 +102,51 @@ static void mutex_free(struct lkl_mutex *_mutex)
 	free(_mutex);
 }
 
+#define TIMER_INTERVAL 10
+static volatile lk_time_t ticks = 0;
+
+void TimerCallback(int sigNum) {
+	ticks += 10;
+    return;
+	if (thread_timer_tick()==INT_RESCHEDULE) {
+		thread_preempt();
+	}
+}
+lk_time_t current_time(void)
+{
+	return ticks;
+}
+
+lk_bigtime_t current_time_hires(void)
+{
+	lk_bigtime_t time;
+
+	time = (lk_bigtime_t)ticks * 1000;
+	return time;
+}
+
+static void setup_scheduler(void) {
+    struct sigaction schedulerHandle;
+    struct itimerval timeQuantum;
+
+    memset(&schedulerHandle, 0, sizeof (schedulerHandle));
+    schedulerHandle.sa_handler = &TimerCallback;
+    sigaction(SIGPROF, &schedulerHandle, NULL);
+
+    timeQuantum.it_value.tv_sec = TIMER_INTERVAL/1000;
+    timeQuantum.it_value.tv_usec = (TIMER_INTERVAL*1000) % 1000000;
+    timeQuantum.it_interval = timeQuantum.it_value;
+    setitimer(ITIMER_PROF, &timeQuantum, NULL);
+}
+
 void __attribute__ ((constructor)) lkl_thread_init(void)
 {
 	thread_init_early();
 	thread_init();
 	thread_create_idle();
 	thread_set_priority(DEFAULT_PRIORITY);
+
+    setup_scheduler();
 }
 
 static lkl_thread_t lkl_thread_create(void (*fn)(void *), void *arg)

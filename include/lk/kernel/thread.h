@@ -227,16 +227,16 @@ static inline __ALWAYS_INLINE uintptr_t __tls_set(uint entry, uintptr_t val)
 struct thread_stats {
     lk_bigtime_t idle_time;
     lk_bigtime_t last_idle_timestamp;
-    ulong reschedules;
-    ulong context_switches;
-    ulong preempts;
-    ulong yields;
-    ulong interrupts; /* platform code increment this */
-    ulong timer_ints; /* timer code increment this */
-    ulong timers; /* timer code increment this */
+    unsigned long reschedules;
+    unsigned long context_switches;
+    unsigned long preempts;
+    unsigned long yields;
+    unsigned long interrupts; /* platform code increment this */
+    unsigned long timer_ints; /* timer code increment this */
+    unsigned long timers; /* timer code increment this */
 
 #if WITH_SMP
-    ulong reschedule_ipis;
+    unsigned long reschedule_ipis;
 #endif
 };
 
