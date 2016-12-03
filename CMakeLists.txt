@@ -19,6 +19,7 @@ add_executable(lklfuse
     ${TOP}/uefi/lkl/tools/lkl/lib/utils.c
     ${TOP}/uefi/lkl/tools/lkl/lib/virtio_blk.c
     ${TOP}/uefi/lkl/tools/lkl/lib/virtio.c
+    ${TOP}/uefi/lkl/tools/lkl/lib/jmp_buf.c
 
     src/posix-host.c
 
