@@ -1,4 +1,3 @@
-#include <pthread.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
@@ -16,16 +15,11 @@
 #include <poll.h>
 #include <lkl_host.h>
 #include <lib/iomem.h>
-
-/* Let's see if the host has semaphore.h */
 #include <unistd.h>
 
-#ifdef _POSIX_SEMAPHORES
-#include <semaphore.h>
-/* TODO(pscollins): We don't support fork() for now, but maybe one day
- * we will? */
-#define SHARE_SEM 0
-#endif /* _POSIX_SEMAPHORES */
+#include <lk/kernel/semaphore.h>
+#include <lk/kernel/mutex.h>
+#include <lk/kernel/thread.h>
 
 static void print(const char *str, int len)
 {
@@ -35,35 +29,12 @@ static void print(const char *str, int len)
 }
 
 struct lkl_mutex {
-	pthread_mutex_t mutex;
+	mutex_t mutex;
 };
 
 struct lkl_sem {
-#ifdef _POSIX_SEMAPHORES
-	sem_t sem;
-#else
-	pthread_mutex_t lock;
-	int count;
-	pthread_cond_t cond;
-#endif /* _POSIX_SEMAPHORES */
+	semaphore_t sem;
 };
-
-#define WARN_UNLESS(exp) do {						\
-		if (exp < 0)						\
-			lkl_printf("%s: %s\n", #exp, strerror(errno));	\
-	} while (0)
-
-static int _warn_pthread(int ret, char *str_exp)
-{
-	if (ret > 0)
-		lkl_printf("%s: %s\n", str_exp, strerror(ret));
-
-	return ret;
-}
-
-
-/* pthread_* functions use the reverse convention */
-#define WARN_PTHREAD(exp) _warn_pthread(exp, #exp)
 
 static struct lkl_sem *sem_alloc(int count)
 {
@@ -73,152 +44,99 @@ static struct lkl_sem *sem_alloc(int count)
 	if (!sem)
 		return NULL;
 
-#ifdef _POSIX_SEMAPHORES
-	if (sem_init(&sem->sem, SHARE_SEM, count) < 0) {
-		lkl_printf("sem_init: %s\n", strerror(errno));
-		free(sem);
-		return NULL;
-	}
-#else
-	pthread_mutex_init(&sem->lock, NULL);
-	sem->count = count;
-	WARN_PTHREAD(pthread_cond_init(&sem->cond, NULL));
-#endif /* _POSIX_SEMAPHORES */
+	sem_init(&sem->sem, count);
 
 	return sem;
 }
 
 static void sem_free(struct lkl_sem *sem)
 {
-#ifdef _POSIX_SEMAPHORES
-	WARN_UNLESS(sem_destroy(&sem->sem));
-#else
-	WARN_PTHREAD(pthread_cond_destroy(&sem->cond));
-	WARN_PTHREAD(pthread_mutex_destroy(&sem->lock));
-#endif /* _POSIX_SEMAPHORES */
+	sem_destroy(&sem->sem);
 	free(sem);
 }
 
 static void sem_up(struct lkl_sem *sem)
 {
-#ifdef _POSIX_SEMAPHORES
-	WARN_UNLESS(sem_post(&sem->sem));
-#else
-	WARN_PTHREAD(pthread_mutex_lock(&sem->lock));
-	sem->count++;
-	if (sem->count > 0)
-		WARN_PTHREAD(pthread_cond_signal(&sem->cond));
-	WARN_PTHREAD(pthread_mutex_unlock(&sem->lock));
-#endif /* _POSIX_SEMAPHORES */
-
+	sem_post(&sem->sem, 1);
 }
 
 static void sem_down(struct lkl_sem *sem)
 {
-#ifdef _POSIX_SEMAPHORES
 	int err;
-
 	do {
+		thread_yield();
 		err = sem_wait(&sem->sem);
-	} while (err < 0 && errno == EINTR);
-	if (err < 0 && errno != EINTR)
-		lkl_printf("sem_wait: %s\n", strerror(errno));
-#else
-	WARN_PTHREAD(pthread_mutex_lock(&sem->lock));
-	while (sem->count <= 0)
-		WARN_PTHREAD(pthread_cond_wait(&sem->cond, &sem->lock));
-	sem->count--;
-	WARN_PTHREAD(pthread_mutex_unlock(&sem->lock));
-#endif /* _POSIX_SEMAPHORES */
+	} while (err < 0);
 }
 
 static struct lkl_mutex *mutex_alloc(void)
 {
 	struct lkl_mutex *_mutex = malloc(sizeof(struct lkl_mutex));
-	pthread_mutex_t *mutex = NULL;
-	pthread_mutexattr_t attr;
+	mutex_t *mutex = NULL;
 
 	if (!_mutex)
 		return NULL;
 
 	mutex = &_mutex->mutex;
-	WARN_PTHREAD(pthread_mutexattr_init(&attr));
 
-	/* PTHREAD_MUTEX_ERRORCHECK is *very* useful for debugging,
-	 * but has some overhead, so we provide an option to turn it
-	 * off. */
-#ifdef DEBUG
-	WARN_PTHREAD(pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK));
-#endif /* DEBUG */
-
-	WARN_PTHREAD(pthread_mutex_init(mutex, &attr));
+	mutex_init(mutex);
 
 	return _mutex;
 }
 
 static void mutex_lock(struct lkl_mutex *mutex)
 {
-	WARN_PTHREAD(pthread_mutex_lock(&mutex->mutex));
+	mutex_acquire(&mutex->mutex);
 }
 
 static void mutex_unlock(struct lkl_mutex *_mutex)
 {
-	pthread_mutex_t *mutex = &_mutex->mutex;
-	WARN_PTHREAD(pthread_mutex_unlock(mutex));
+	mutex_t *mutex = &_mutex->mutex;
+	mutex_release(mutex);
 }
 
 static void mutex_free(struct lkl_mutex *_mutex)
 {
-	pthread_mutex_t *mutex = &_mutex->mutex;
-	WARN_PTHREAD(pthread_mutex_destroy(mutex));
+	mutex_t *mutex = &_mutex->mutex;
+	mutex_destroy(mutex);
 	free(_mutex);
 }
 
-static lkl_thread_t thread_create(void (*fn)(void *), void *arg)
+void __attribute__ ((constructor)) lkl_thread_init(void)
 {
-	pthread_t thread;
-	if (WARN_PTHREAD(pthread_create(&thread, NULL, (void* (*)(void *))fn, arg)))
+	thread_init_early();
+	thread_init();
+	thread_create_idle();
+	thread_set_priority(DEFAULT_PRIORITY);
+}
+
+static lkl_thread_t lkl_thread_create(void (*fn)(void *), void *arg)
+{
+	thread_t *thread = thread_create("lkl", (int (*)(void *))fn, arg, DEFAULT_PRIORITY, 2*1024*1024);
+	if (!thread)
 		return 0;
-	else
+	else {
+		thread_resume(thread);
 		return (lkl_thread_t) thread;
+	}
 }
 
-static void thread_detach(void)
+static void lkl_thread_detach(void)
 {
-	WARN_PTHREAD(pthread_detach(pthread_self()));
+	thread_detach(get_current_thread());
 }
 
-static void thread_exit(void)
+static void lkl_thread_exit(void)
 {
-	pthread_exit(NULL);
+	thread_exit(0);
 }
 
-static int thread_join(lkl_thread_t tid)
+static int lkl_thread_join(lkl_thread_t tid)
 {
-	if (WARN_PTHREAD(pthread_join((pthread_t)tid, NULL)))
+	if (thread_join((thread_t *)tid, NULL, INFINITE_TIME))
 		return -1;
 	else
 		return 0;
-}
-
-static int tls_alloc(unsigned int *key, void (*destructor)(void *))
-{
-	return pthread_key_create((pthread_key_t *)key, destructor);
-}
-
-static int tls_free(unsigned int key)
-{
-	return pthread_key_delete(key);
-}
-
-static int tls_set(unsigned int key, void *data)
-{
-	return pthread_setspecific(key, data);
-}
-
-static void *tls_get(unsigned int key)
-{
-	return pthread_getspecific(key);
 }
 
 static unsigned long long time_ns(void)
@@ -269,18 +187,14 @@ static void timer_free(void *_timer)
 	timer_delete(timer);
 }
 
-static void panic(void)
+static void lkl_panic(void)
 {
 	assert(0);
 }
 
 static long _gettid(void)
 {
-#ifdef	__FreeBSD__
-	return (long)pthread_self();
-#else
-	return syscall(SYS_gettid);
-#endif
+	return (long)get_current_thread();
 }
 
 static void* lkl_mem_alloc(unsigned long size) {
@@ -288,11 +202,11 @@ static void* lkl_mem_alloc(unsigned long size) {
 }
 
 struct lkl_host_operations lkl_host_ops = {
-	.panic = panic,
-	.thread_create = thread_create,
-	.thread_detach = thread_detach,
-	.thread_exit = thread_exit,
-	.thread_join = thread_join,
+	.panic = lkl_panic,
+	.thread_create = lkl_thread_create,
+	.thread_detach = lkl_thread_detach,
+	.thread_exit = lkl_thread_exit,
+	.thread_join = lkl_thread_join,
 	.sem_alloc = sem_alloc,
 	.sem_free = sem_free,
 	.sem_up = sem_up,
@@ -301,10 +215,6 @@ struct lkl_host_operations lkl_host_ops = {
 	.mutex_free = mutex_free,
 	.mutex_lock = mutex_lock,
 	.mutex_unlock = mutex_unlock,
-	.tls_alloc = tls_alloc,
-	.tls_free = tls_free,
-	.tls_set = tls_set,
-	.tls_get = tls_get,
 	.time = time_ns,
 	.timer_alloc = timer_alloc,
 	.timer_set_oneshot = timer_set_oneshot,
